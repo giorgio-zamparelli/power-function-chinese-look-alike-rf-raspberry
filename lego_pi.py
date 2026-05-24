@@ -151,6 +151,95 @@ def tx_loop():
         else:
             time.sleep(0.2)
 
+# ---- direct gamepad control via evdev (left stick -> Output A, right stick -> Output B) ----
+al = 0; bl = 0; actx = 0; bctx = 0          # tracked speed notch + direction context per output
+gp_target = {"a": 0, "b": 0}
+gp_name = None
+MAXN = 7
+
+def a_cw():
+    global actx, al
+    if actx != 1: set_ch("a", 0x10); actx = 1
+    seq_ch("a", [0x50, 0x90]); al += 1
+def a_ccw():
+    global actx, al
+    if actx != 2: set_ch("a", 0x20); actx = 2
+    seq_ch("a", [0x60, 0xA0]); al -= 1
+def a_brake():
+    global actx, al
+    set_ch("a", 0x30); actx = 0; al = 0
+def b_cw():
+    global bctx, bl
+    if bctx != 1: set_ch("b", 0x01); bctx = 1
+    seq_ch("b", [0x05, 0x09]); bl += 1
+def b_ccw():
+    global bctx, bl
+    if bctx != 2: set_ch("b", 0x02); bctx = 2
+    seq_ch("b", [0x06, 0x0A]); bl -= 1
+def b_brake():
+    global bctx, bl
+    set_ch("b", 0x03); bctx = 0; bl = 0
+
+def _notch(value, ai):
+    center = (ai.min + ai.max) / 2.0
+    half = (ai.max - ai.min) / 2.0 or 1.0
+    v = (value - center) / half
+    dz = max(0.18, (ai.flat or 0) / half)
+    if abs(v) < dz: return 0
+    n = int(round(-v * MAXN))           # stick up (negative axis) -> positive notch (forward)
+    return max(-MAXN, min(MAXN, n))
+
+def _find_gamepad():
+    try:
+        from evdev import InputDevice, list_devices, ecodes
+    except Exception:
+        return None
+    for path in list_devices():
+        try:
+            d = InputDevice(path)
+            if ecodes.ABS_Y in d.capabilities().get(ecodes.EV_ABS, []):   # has a left stick -> gamepad
+                return d
+        except Exception:
+            pass
+    return None
+
+def gamepad_reader():
+    global gp_name
+    try:
+        from evdev import ecodes
+    except Exception:
+        print("python3-evdev not installed; gamepad disabled"); return
+    while True:
+        dev = _find_gamepad()
+        if not dev:
+            gp_name = None; time.sleep(3); continue
+        gp_name = dev.name; print("gamepad connected:", dev.name)
+        try:
+            ly = dev.absinfo(ecodes.ABS_Y)
+            try: ry = dev.absinfo(ecodes.ABS_RY)
+            except Exception: ry = None
+            for ev in dev.read_loop():
+                if ev.type == ecodes.EV_ABS:
+                    if ev.code == ecodes.ABS_Y:   gp_target["a"] = _notch(ev.value, ly)
+                    elif ev.code == ecodes.ABS_RY and ry: gp_target["b"] = _notch(ev.value, ry)
+                elif ev.type == ecodes.EV_KEY and ev.value == 1 and ev.code in (ecodes.BTN_SOUTH, ecodes.BTN_START):
+                    gp_target["a"] = 0; gp_target["b"] = 0; stop_all()
+        except OSError:
+            print("gamepad disconnected"); gp_name = None; time.sleep(2)
+
+def gamepad_stepper():
+    while True:
+        ta, tb = gp_target["a"], gp_target["b"]
+        if ta == 0:
+            if al != 0 or actx != 0: a_brake()
+        elif al < ta: a_cw()
+        elif al > ta: a_ccw()
+        if tb == 0:
+            if bl != 0 or bctx != 0: b_brake()
+        elif bl < tb: b_cw()
+        elif bl > tb: b_ccw()
+        time.sleep(0.12)
+
 # ---- web UI (same look + behaviour as the Arduino version) ----
 STYLE = """
  :root{--bg:#0f1115;--fg:#e8eaed;--mut:#8b909a;--grn:#2ecc71;--blu:#3aa0ff;--red:#ff4d4f;--ylw:#f5c451}
@@ -287,7 +376,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/":            self._html(CONTROL_HTML)
         elif u.path == "/grid":      self._html(GRID_HTML)
         elif u.path == "/status":
-            body = json.dumps({"connected": radio_ok, "channel": curChannel}).encode()
+            body = json.dumps({"connected": radio_ok, "channel": curChannel, "gamepad": gp_name}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         elif u.path == "/set":
@@ -313,6 +402,8 @@ if __name__ == "__main__":
     radio_init()
     set_channel(1)
     threading.Thread(target=tx_loop, daemon=True).start()
+    threading.Thread(target=gamepad_reader, daemon=True).start()
+    threading.Thread(target=gamepad_stepper, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), H)
     print("controls: http://<pi-ip>:%d/   grid: /grid" % HTTP_PORT)
     srv.serve_forever()
